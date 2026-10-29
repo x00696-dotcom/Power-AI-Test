@@ -5,15 +5,15 @@ import time
 import threading
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
-from flask import Flask, send_file, jsonify, request
+from flask import Flask, send_file, jsonify, request, redirect, Response
 
 BASE = Path(__file__).resolve().parent
 app = Flask(__name__)
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "PowerAI-2ndSource/1.5.11"})
+HTTP.headers.update({"User-Agent": "PowerAI-2ndSource/1.5.13"})
 
 NEXAR_TOKEN = {"value": None, "expires": 0.0}
 TOKEN_LOCK = threading.Lock()
@@ -596,7 +596,7 @@ def exp_export_sop():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "Power AI V15.11 Online 2nd Source Bridge", "providers": provider_status()})
+    return jsonify({"ok": True, "service": "Power AI V15.13 Online 2nd Source Bridge", "providers": provider_status()})
 
 
 @app.get("/api/provider-status")
@@ -622,38 +622,96 @@ def _safe_pdf_filename(mpn):
     return (base or "datasheet")[:100] + ".pdf"
 
 
-def _download_datasheet_for_mpn(mpn):
-    if not provider_status().get("mouser"):
-        raise RuntimeError("Mouser Search API 尚未設定，無法直接下載 Datasheet。")
+def _datasheet_url_from_parts(parts, mpn):
+    # Prefer exact MPN; otherwise same-series MPNs that expose a datasheet URL.
+    wanted = _norm(mpn)
+    if not parts:
+        return "", None
 
-    raw = mouser_part_search(mpn)
-    exact = _pick_exact_mouser(raw, mpn)
-    if not exact:
-        raise RuntimeError("Mouser 找不到此料號，無法下載 Datasheet。")
+    ranked = []
+    for idx, part in enumerate(parts):
+        pmpn = str(part.get("ManufacturerPartNumber") or "")
+        norm = _norm(pmpn)
+        ds = str(part.get("DataSheetUrl") or "").strip()
+        product_url = str(part.get("ProductDetailUrl") or "").strip()
+        score = 0
+        if norm == wanted:
+            score += 1000
+        elif norm.startswith(wanted) or wanted.startswith(norm):
+            score += 700
+        elif wanted and wanted in norm:
+            score += 500
+        if ds:
+            score += 250
+        if product_url:
+            score += 40
+        score -= idx * 0.01
+        ranked.append((score, ds, part))
 
-    url = str(exact.get("DataSheetUrl") or "").strip()
-    if not url:
-        raise RuntimeError("Mouser 沒有提供此料號的 Datasheet URL。")
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    for score, ds, part in ranked:
+        norm = _norm(part.get("ManufacturerPartNumber"))
+        if ds and (norm == wanted or norm.startswith(wanted) or wanted in norm):
+            return ds, part
+    for score, ds, part in ranked:
+        if ds:
+            return ds, part
+    return "", ranked[0][2] if ranked else None
 
+
+def _pdf_url_from_product_page(product_url):
+    if not product_url:
+        return ""
+    try:
+        r = HTTP.get(product_url, timeout=25, allow_redirects=True,
+                     headers={"Accept": "text/html,application/xhtml+xml"})
+        if not r.ok:
+            return ""
+        body = r.text or ""
+        candidates = []
+        href_pat = re.compile(r'(?:href|src)=[\"\\\']([^\"\\\']+)[\"\\\']', re.I)
+        for m in href_pat.finditer(body):
+            raw = m.group(1).replace('&amp;', '&')
+            low = raw.lower()
+            if '/datasheet/' in low or '.pdf' in low:
+                url = urljoin(r.url, raw)
+                score = 20
+                if '/datasheet/' in low: score += 30
+                if low.endswith('.pdf') or '.pdf?' in low: score += 20
+                context = body[max(0,m.start()-250):m.end()+250].lower()
+                if 'datasheet' in context: score += 40
+                candidates.append((score, url))
+        embedded_pat = re.compile(r'https?:\\?/\\?/[^\"\\\'<>\\s]+', re.I)
+        for m in embedded_pat.finditer(body):
+            raw = m.group(0).replace('\\/','/')
+            low = raw.lower()
+            if '/datasheet/' in low or '.pdf' in low:
+                score = 15 + (30 if '/datasheet/' in low else 0) + (20 if '.pdf' in low else 0)
+                candidates.append((score, raw))
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return ""
+
+
+def _fetch_pdf(url):
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise RuntimeError("Datasheet URL 格式無效。")
-
-    # Fetch only the URL returned by Mouser. Cap file size to keep the bridge lightweight.
     r = HTTP.get(url, timeout=35, allow_redirects=True,
                  headers={"Accept": "application/pdf,*/*;q=0.8"}, stream=True)
     if not r.ok:
         raise RuntimeError(f"Datasheet server returned HTTP {r.status_code}.")
-
     max_bytes = 30 * 1024 * 1024
     content_len = r.headers.get("Content-Length")
     if content_len:
         try:
             if int(content_len) > max_bytes:
-                raise RuntimeError("Datasheet 超過 30 MB，請改用「開啟」按鈕從原網站取得。")
+                raise RuntimeError("Datasheet 超過 30 MB，請改用商品頁取得。")
         except ValueError:
             pass
-
     buf = io.BytesIO()
     total = 0
     for chunk in r.iter_content(chunk_size=65536):
@@ -661,39 +719,94 @@ def _download_datasheet_for_mpn(mpn):
             continue
         total += len(chunk)
         if total > max_bytes:
-            raise RuntimeError("Datasheet 超過 30 MB，請改用「開啟」按鈕從原網站取得。")
+            raise RuntimeError("Datasheet 超過 30 MB，請改用商品頁取得。")
         buf.write(chunk)
-
     data = buf.getvalue()
-    # Some sites return HTML landing pages even when Mouser's field is called DataSheetUrl.
     ctype = str(r.headers.get("Content-Type") or "").lower()
     if not data.startswith(b"%PDF-") and "application/pdf" not in ctype:
-        raise RuntimeError("原廠 Datasheet URL 沒有直接回傳 PDF，請使用「開啟」按鈕。")
-
+        raise RuntimeError("Datasheet URL 沒有直接回傳 PDF。")
     buf.seek(0)
     return buf
+
+
+def _download_datasheet_for_mpn(mpn):
+    if not provider_status().get("mouser"):
+        raise RuntimeError("Mouser Search API 尚未設定，無法下載 Datasheet。")
+
+    parts = mouser_part_search(mpn)
+    ds_url, best = _datasheet_url_from_parts(parts, mpn)
+
+    if not ds_url:
+        try:
+            more = mouser_keyword(mpn, 50)
+            ds_url2, best2 = _datasheet_url_from_parts(more, mpn)
+            if ds_url2:
+                ds_url, best = ds_url2, best2
+            elif best is None and best2 is not None:
+                best = best2
+        except Exception:
+            pass
+
+    if ds_url:
+        try:
+            return _fetch_pdf(ds_url), best
+        except RuntimeError:
+            pass
+
+    product_url = str((best or {}).get("ProductDetailUrl") or "").strip()
+    page_pdf = _pdf_url_from_product_page(product_url)
+    if page_pdf:
+        try:
+            return _fetch_pdf(page_pdf), best
+        except RuntimeError:
+            pass
+
+    wanted = _norm(mpn)
+    for part in parts:
+        norm = _norm(part.get("ManufacturerPartNumber"))
+        if not (norm == wanted or norm.startswith(wanted) or wanted in norm):
+            continue
+        product_url2 = str(part.get("ProductDetailUrl") or "").strip()
+        page_pdf2 = _pdf_url_from_product_page(product_url2)
+        if page_pdf2:
+            try:
+                return _fetch_pdf(page_pdf2), part
+            except RuntimeError:
+                continue
+
+    raise RuntimeError("Mouser 找到料號，但無法取得可直接下載的 Datasheet PDF。")
 
 
 @app.get("/api/datasheet")
 def api_datasheet():
     mpn = str(request.args.get("mpn") or "").strip()
     if len(mpn) < 2 or len(mpn) > 120:
-        return jsonify({"error": "請提供有效的 Manufacturer Part Number"}), 400
+        return Response("Invalid Manufacturer Part Number", status=400, mimetype="text/plain")
     if not re.fullmatch(r"[A-Za-z0-9_+./()#\- ]+", mpn):
-        return jsonify({"error": "料號包含不支援的字元"}), 400
+        return Response("Unsupported characters in MPN", status=400, mimetype="text/plain")
     try:
-        pdf = _download_datasheet_for_mpn(mpn)
+        pdf, part = _download_datasheet_for_mpn(mpn)
+        actual_mpn = str((part or {}).get("ManufacturerPartNumber") or mpn)
         return send_file(
             pdf,
             as_attachment=True,
-            download_name=_safe_pdf_filename(mpn),
+            download_name=_safe_pdf_filename(actual_mpn),
             mimetype="application/pdf",
             max_age=0
         )
     except RuntimeError as e:
-        return jsonify({"error": str(e)}), 502
+        # Last fallback: open the best Mouser product page instead of returning raw JSON.
+        try:
+            parts = mouser_part_search(mpn)
+            _, best = _datasheet_url_from_parts(parts, mpn)
+            product_url = str((best or {}).get("ProductDetailUrl") or "").strip()
+            if product_url:
+                return redirect(product_url, code=302)
+        except Exception:
+            pass
+        return Response(str(e), status=502, mimetype="text/plain; charset=utf-8")
     except Exception as e:
-        return jsonify({"error": "Datasheet download unexpected error: " + str(e)}), 500
+        return Response("Datasheet download unexpected error: " + str(e), status=500, mimetype="text/plain; charset=utf-8")
 
 
 @app.post("/api/crossref")
