@@ -1,9 +1,11 @@
 import os
+import io
 import re
 import time
 import threading
 from difflib import SequenceMatcher
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, send_file, jsonify, request
@@ -11,7 +13,7 @@ from flask import Flask, send_file, jsonify, request
 BASE = Path(__file__).resolve().parent
 app = Flask(__name__)
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "PowerAI-2ndSource/1.5.1"})
+HTTP.headers.update({"User-Agent": "PowerAI-2ndSource/1.5.11"})
 
 NEXAR_TOKEN = {"value": None, "expires": 0.0}
 TOKEN_LOCK = threading.Lock()
@@ -594,7 +596,7 @@ def exp_export_sop():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "Power AI V15 Online 2nd Source Bridge", "providers": provider_status()})
+    return jsonify({"ok": True, "service": "Power AI V15.11 Online 2nd Source Bridge", "providers": provider_status()})
 
 
 @app.get("/api/provider-status")
@@ -612,6 +614,86 @@ def api_provider_status():
                            "message": "Configured; authorization is checked on search" if p.get("nexar") else "Not configured"}
     online = mouser_ok or bool(p.get("nexar"))
     return jsonify({"ok": True, "online": online, "providers": p, "validation": validation})
+
+
+
+def _safe_pdf_filename(mpn):
+    base = re.sub(r"[^A-Za-z0-9._+-]+", "_", str(mpn or "datasheet")).strip("._")
+    return (base or "datasheet")[:100] + ".pdf"
+
+
+def _download_datasheet_for_mpn(mpn):
+    if not provider_status().get("mouser"):
+        raise RuntimeError("Mouser Search API 尚未設定，無法直接下載 Datasheet。")
+
+    raw = mouser_part_search(mpn)
+    exact = _pick_exact_mouser(raw, mpn)
+    if not exact:
+        raise RuntimeError("Mouser 找不到此料號，無法下載 Datasheet。")
+
+    url = str(exact.get("DataSheetUrl") or "").strip()
+    if not url:
+        raise RuntimeError("Mouser 沒有提供此料號的 Datasheet URL。")
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise RuntimeError("Datasheet URL 格式無效。")
+
+    # Fetch only the URL returned by Mouser. Cap file size to keep the bridge lightweight.
+    r = HTTP.get(url, timeout=35, allow_redirects=True,
+                 headers={"Accept": "application/pdf,*/*;q=0.8"}, stream=True)
+    if not r.ok:
+        raise RuntimeError(f"Datasheet server returned HTTP {r.status_code}.")
+
+    max_bytes = 30 * 1024 * 1024
+    content_len = r.headers.get("Content-Length")
+    if content_len:
+        try:
+            if int(content_len) > max_bytes:
+                raise RuntimeError("Datasheet 超過 30 MB，請改用「開啟」按鈕從原網站取得。")
+        except ValueError:
+            pass
+
+    buf = io.BytesIO()
+    total = 0
+    for chunk in r.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError("Datasheet 超過 30 MB，請改用「開啟」按鈕從原網站取得。")
+        buf.write(chunk)
+
+    data = buf.getvalue()
+    # Some sites return HTML landing pages even when Mouser's field is called DataSheetUrl.
+    ctype = str(r.headers.get("Content-Type") or "").lower()
+    if not data.startswith(b"%PDF-") and "application/pdf" not in ctype:
+        raise RuntimeError("原廠 Datasheet URL 沒有直接回傳 PDF，請使用「開啟」按鈕。")
+
+    buf.seek(0)
+    return buf
+
+
+@app.get("/api/datasheet")
+def api_datasheet():
+    mpn = str(request.args.get("mpn") or "").strip()
+    if len(mpn) < 2 or len(mpn) > 120:
+        return jsonify({"error": "請提供有效的 Manufacturer Part Number"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9_+./()#\- ]+", mpn):
+        return jsonify({"error": "料號包含不支援的字元"}), 400
+    try:
+        pdf = _download_datasheet_for_mpn(mpn)
+        return send_file(
+            pdf,
+            as_attachment=True,
+            download_name=_safe_pdf_filename(mpn),
+            mimetype="application/pdf",
+            max_age=0
+        )
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        return jsonify({"error": "Datasheet download unexpected error: " + str(e)}), 500
 
 
 @app.post("/api/crossref")
